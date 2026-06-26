@@ -1,0 +1,88 @@
+import base64
+import io
+from flask import Blueprint, request, jsonify
+from .classifier import classify_image
+from .database import save_assessment, get_history, delete_assessment
+
+bp = Blueprint("api", __name__)
+
+ALLOWED_EXTENSIONS = {"jpg", "jpeg", "png", "webp"}
+
+
+def _allowed(filename: str) -> bool:
+    return "." in filename and filename.rsplit(".", 1)[1].lower() in ALLOWED_EXTENSIONS
+
+
+def _to_b64(data: bytes, mime: str = "image/jpeg") -> str:
+    return f"data:{mime};base64,{base64.b64encode(data).decode()}"
+
+
+# ── Health ────────────────────────────────────────────────────────────────────
+
+@bp.get("/health")
+def health():
+    return jsonify({"status": "ok"})
+
+
+# ── Assess ────────────────────────────────────────────────────────────────────
+
+@bp.post("/assess")
+def assess():
+    files = request.files.getlist("images")
+    if not files or all(f.filename == "" for f in files):
+        return jsonify({"error": "No images provided"}), 400
+
+    results = []
+    for f in files:
+        if not _allowed(f.filename):
+            results.append({"filename": f.filename, "error": "Unsupported file type"})
+            continue
+
+        data = f.read()
+        try:
+            result = classify_image(data)
+        except Exception as e:
+            results.append({"filename": f.filename, "error": str(e)})
+            continue
+
+        # Determine MIME
+        ext  = f.filename.rsplit(".", 1)[1].lower()
+        mime = "image/png" if ext == "png" else "image/webp" if ext == "webp" else "image/jpeg"
+        b64  = _to_b64(data, mime)
+
+        row_id = save_assessment(
+            filename=f.filename,
+            grade=result["grade"],
+            confidence=result["confidence"],
+            details=result["details"],
+            image_data=b64,
+        )
+
+        results.append({
+            "id":         row_id,
+            "filename":   f.filename,
+            "grade":      result["grade"],
+            "confidence": result["confidence"],
+            "details":    result["details"],
+            "badge":      result["badge"],
+            "color":      result["color"],
+            "bbox":       result["bbox"],
+            "image_data": b64,
+        })
+
+    return jsonify({"results": results})
+
+
+# ── History ───────────────────────────────────────────────────────────────────
+
+@bp.get("/history")
+def history():
+    limit = request.args.get("limit", 50, type=int)
+    rows  = get_history(limit)
+    return jsonify({"history": rows})
+
+
+@bp.delete("/history/<int:assessment_id>")
+def delete(assessment_id: int):
+    delete_assessment(assessment_id)
+    return jsonify({"deleted": assessment_id})
